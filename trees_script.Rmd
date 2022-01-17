@@ -1,0 +1,340 @@
+---
+title: "Apple Health ML"
+author: "Andrea Quets"
+date: "1/9/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+packages = c("tidyverse", "XML", "lubridate", "rpart", "rpart.plot", "randomForest", "gbm", "caret")
+#sapply(packages, install.packages) #uncomment to install packages, if you do not already have them. Some of these packages are large and will take a long time to install. 
+sapply(packages, library, character.only = T)
+
+base_dir = "C:/Users/Andrea/Desktop/senior_project/"
+```
+
+```{r}
+#load the data and convert to a dataframe
+xml = xmlParse(str_c(base_dir, "export/apple_health_export/export.xml"))
+dist_data = XML:::xmlAttrsToDataFrame(xml["//Record"])
+
+```
+
+```{r}
+#tidy the data so that it has usable variables
+
+dist_data1 = dist_data %>% 
+	  filter(type == "HKQuantityTypeIdentifierDistanceWalkingRunning") %>% 
+	  mutate(value = as.numeric(value)) %>% 
+	  select(-type, -sourceName, -unit, - device, -sourceVersion) %>% 
+	  mutate(start = ymd_hms(startDate),
+	         end = ymd_hms(endDate),
+	         startYear = year(start),
+	         startMonth = month(start),
+	         startDay = day(start),
+	         startHour = hour(start),
+	         startMin = minute(start),
+	         interval = interval(start, end),
+	         dT = time_length(interval, "hour"),
+	         dT = if_else(dT == 0, .00001, dT),
+	         endYear = year(end),
+	         endMonth = month(end),
+	         endDay = day(end),
+	         endHour = hour(end),
+	         endMin = minute(end))
+
+```
+
+```{r}
+
+#add outside data sources that may be predictive
+dist_data1 = dist_data1 %>% 
+	  mutate(pandemic = as.factor(if_else(startYear > 2020 | (startYear == 2020 & startMonth >= 3), T, F)),
+	         season = if_else(startMonth %in% c(6,7,8), "summer", "NA"),
+	         season = if_else(startMonth %in% c(12,1,2), "winter", season),
+	         season = if_else(startMonth %in% c(3,4,5), "spring", season),
+	         season = if_else(startMonth %in% c(9,10,11), "fall", season),
+	         school_month = if_else(startMonth %in% c(1,2,3,4,5,9,10,11), T, F), 
+	         weekend = if_else(weekdays(start) %in% c("Saturday", "Sunday"), "weekend", "weekday"),
+	         day_of_week = weekdays(start),
+	         daytime = if_else(startHour %in% c(21,22,23, 24, 1,2,3,4,5,6), "nighttime", "daytime"),
+	         mph = value/dT,
+	         startYear = as.factor(startYear),
+	         startMonth = as.factor(startMonth),
+	         startDay = as.factor(startDay),
+	         startHour = as.factor(startHour))
+
+```
+
+```{r}
+
+#work the data into three different versions, each with a different perpective on the data
+dist_data2 = dist_data1 %>% 
+	  group_by(startHour, startDay, startMonth, startYear) %>% 
+	  mutate(hourly_value = sum(value)) %>% 
+	  mutate(mph = weighted.mean(mph, dT/60, na.rm = T),
+	         dT_hour = sum(dT, na.rm = T)) %>% 
+	  select(hourly_value, daytime, season, weekend, startMonth, startHour, startDay, startYear, school_month, day_of_week, pandemic, mph, dT_hour) %>% 
+	  distinct()
+
+dist_data3 = dist_data2 %>% 
+	  group_by(startMonth, startYear) %>% 
+	  mutate(monthly_value = sum(hourly_value))
+
+dist_data4 = dist_data2 %>% 
+	  group_by(startMonth, startYear, startDay) %>% 
+	  mutate(daily_value = sum(hourly_value))%>% 
+	  mutate(mpd = weighted.mean(mph,dT_hour/24, na.rm = T)) %>% 
+	  select(-dT_hour, -mph, - startHour, - hourly_value) %>% 
+	  distinct()
+
+```
+
+```{r}
+
+#some basic data exploration
+
+dist_data4 %>% 
+  ggplot(aes(x = mpd, y = daily_value))+
+  geom_point()+
+  facet_grid(season~weekend)
+
+dist_data4 %>% 
+  ggplot(aes(x = mpd, y = daily_value, color = weekend))+
+  geom_point()
+
+df = dist_data3 %>%
+  select(-hourly_value, - mph, -dT_hour, -monthly_value) %>% 
+    gather(-pandemic, key="var", value = "value")
+
+ggplot(df, aes(x = pandemic, y = value)) +
+    geom_point() +
+    facet_wrap(~var, scales = "free") 
+
+df = dist_data3 %>%
+  ungroup() %>% 
+  select(hourly_value,  mph, dT_hour, monthly_value, pandemic) %>% 
+    gather(-pandemic, key="var", value = "value") %>% 
+  mutate(value = as.numeric(value))
+
+ggplot(df, aes(x = pandemic, y = value)) +
+    geom_boxplot() +
+    facet_wrap(~var, scales = "free") 
+```
+
+```{r}
+#divide data into testing and training sets
+set.seed(10)
+sample = sample(nrow(dist_data4), nrow(dist_data4)*.5)
+train = dist_data4[sample,]
+test = dist_data4[-sample,]
+
+#apply a chassification tree predicting weekends vs weekdays and print out relevant results
+fit = rpart(weekend~mpd+daily_value+season,
+            method="class", data=train)
+printcp(fit) 
+plotcp(fit) 
+summary(fit) 
+rpart.plot(fit, type = 4, clip.right.labs = FALSE, branch = .3, under = TRUE)
+pfit= prune(fit, cp=fit$cptable[which.min(fit$cptable[,"xerror"]),"CP"])   
+rpart.plot(pfit, type = 4, clip.right.labs = FALSE, branch = .3, under = TRUE)
+
+#predict weekends on the test data and build a confusion matrix
+pred = predict(pfit, test, type="class")
+confusionMatrix(table(pred, test$weekend))
+
+#equalize weekends and weekdays in training data
+dist_data4_weekend = train %>% 
+  filter(weekend == 'weekend')
+dist_data4_weekday = train %>% 
+  filter(weekend == 'weekday') 
+rows = sample(nrow(dist_data4_weekday), nrow(dist_data4_weekend))
+dist_data4_weekday = dist_data4_weekday[rows,]
+dist_data4_both = bind_rows(dist_data4_weekday,dist_data4_weekend)
+
+##apply a chassification tree predicting weekends vs weekdays from updated data and print out relevant results
+fit = rpart(weekend~mpd+daily_value+season,
+            method="class", data= dist_data4_both)
+printcp(fit) 
+plotcp(fit) 
+summary(fit) 
+rpart.plot(fit, type = 4, clip.right.labs = FALSE, branch = .3, under = TRUE)
+pfit= prune(fit, cp=fit$cptable[which.min(fit$cptable[,"xerror"]),"CP"])   
+rpart.plot(pfit, type = 4, clip.right.labs = FALSE, branch = .3, under = TRUE)
+
+#predict weekends on the test data and build a confusion matrix
+pred = predict(fit, test, type="class")
+confusionMatrix(table(pred, test$weekend))
+
+
+
+```
+
+
+```{r}
+
+ #prepare data for random forest
+dist_data3 = dist_data3 %>% 
+  filter(!is.na(pandemic))
+
+sample = sample(nrow(dist_data3), nrow(dist_data3)*.5)
+train = dist_data3[sample,]
+test = dist_data3[-sample,]
+
+#apply a random forest to predict whether its a pandemic or not. 
+
+fit =randomForest(pandemic~ hourly_value+daytime+ season+ weekend+startHour+school_month+day_of_week+mph+startMonth+monthly_value,   data= train)
+print(fit) 
+imp = importance(fit)
+imp
+importance = imp[order(imp[,1]),]
+dotplot(importance) 
+
+#predict pandemics on test data and build a confusion matrix
+pred = predict(fit, test, type = "class")
+confusionMatrix(table(pred, test$pandemic))
+```
+
+
+```{r}
+#prepare data for random forest
+dist_data4 = dist_data4 %>% 
+  mutate(weekend = ifelse(weekend == "weekend", 1, 0)) 
+
+sample = sample(nrow(dist_data4), nrow(dist_data4)*.5)
+train = dist_data4[sample,]
+test = dist_data4[-sample,]
+train = train %>% 
+  mutate(weekend = as.factor(weekend))
+dist_data4_weekend = train %>% 
+  filter(weekend == 1)
+dist_data4_weekday = train %>% 
+  filter(weekend == 0) 
+rows = sample(nrow(dist_data4_weekday), nrow(dist_data4_weekend))
+dist_data4_weekday = dist_data4_weekday[rows,]
+dist_data4_both = bind_rows(dist_data4_weekday,dist_data4_weekend )
+test = test %>% 
+  mutate(weekend = as.factor(weekend))
+
+#apply a random forest to predict weekends. 
+fit <- randomForest(weekend~mpd+daily_value+season,   data= train)
+print(fit) 
+imp = importance(fit)
+imp
+importance <- imp[order(imp[,1]),]
+dotplot(importance) 
+
+#predict weekends on the test data and build a confusion matrix
+pred = predict(fit, test, type = "class")
+
+confusionMatrix(table( pred, test$weekend)[1:2, 2:1])
+```
+
+
+
+```{r}
+
+#create a 5th version of data that gets it ready for GBM
+dist_data5 = dist_data3 %>% 
+  mutate(daytime = if_else(daytime == "daytime", 1, 0)) %>% 
+  mutate(weekend = if_else(weekend == "weekend", 1, 0)) %>% 
+  mutate(day_of_week = if_else(day_of_week == "Monday", "1", day_of_week),
+         day_of_week = if_else(day_of_week == "Tuesday", "2", day_of_week),
+         day_of_week = if_else(day_of_week == "Wednesday", "3", day_of_week),
+         day_of_week = if_else(day_of_week == "Thursday", "4", day_of_week),
+         day_of_week = if_else(day_of_week == "Friday", "5", day_of_week),
+         day_of_week = if_else(day_of_week == "Saturday", "6", day_of_week),
+         day_of_week = if_else(day_of_week == "Sunday", "7", day_of_week)) %>% 
+  mutate(season = if_else(season == "fall", "4", season),
+         season = if_else(season == "winter", "1", season),
+         season = if_else(season == "spring", "2", season),
+         season = if_else(season == "summer", "3", season)) %>% 
+  mutate(season = as.numeric(season),
+         day_of_week = as.numeric(day_of_week)) %>% 
+  mutate(school_month = as.numeric(school_month),
+         pandemic = as.numeric(pandemic),
+         startMonth = as.numeric(startMonth),
+         startHour = as.numeric(startHour),
+         startDay = as.numeric(startDay),
+         startYear = as.numeric(startYear))
+
+```
+
+
+
+
+```{r}
+#set of training and test data
+sample = sample(nrow(dist_data5), nrow(dist_data5)*.5)
+training = dist_data5[sample,]
+test = dist_data5[-sample,]
+
+
+#perform a random grid search to determine best parameters and prevent overfitting
+fitControl = trainControl(method = "repeatedcv",
+number = 3,
+repeats = 5,
+search = "random")
+
+
+GBM_grid_random = train(weekend~ hourly_value+daytime+ season+ pandemic+startHour+school_month+mph+startMonth+monthly_value,
+data = training,
+method = "gbm",
+distribution= "adaboost",
+trControl = fitControl,
+verbose = TRUE,
+tuneLength = 5)
+```
+
+
+```{r}
+#edit parameter values to those that performed best in the grid search, then perfrom the GBM
+gbm = gbm::gbm(formula=weekend~ hourly_value+daytime+ season+ pandemic+startHour+school_month+mph+startMonth+mph,   
+          distribution = "adaboost", 
+          data= training, 
+          interaction.depth = 2, 
+          n.trees = 1257, 
+          shrinkage = .4249, 
+          verbose = T, 
+          cv.folds = 5,
+          n.minobsinnode = 21)
+```
+
+```{r}
+#print partial dependence and relative importance plots
+
+for (i in 1:length(gbm$var.names)){
+  plt = plot(gbm, i.var = i)
+  print(plt)
+}
+
+summary(gbm)
+
+gbm.perf(gbm, method = "cv")
+```
+
+
+```{r}
+
+#apply to test data and build a confusion matrix to assess accuracy. 
+preds = format(round(predict(gbm, test, na.action = na.pass)))
+
+preds = as.factor(preds)
+ref = as.factor(test$weekend)
+
+levels(preds) = list ("0"  = "-1", "1" = " 0")
+
+
+confusionMatrix(table(preds, ref))
+
+
+```
+
+
+
+
+
+
